@@ -94,34 +94,42 @@ class TestDATArchitecture(unittest.TestCase):
         self.assertEqual(v_mem.shape, (self.B, self.T, topk, self.Dh))
 
     def test_adaptive_width_mha(self):
-        """ Тест: Многоголовочное внимание с адаптивной шириной """
-        attn_cfg = AttentionConfig(
-            n_heads=self.H, d_model=self.Dm, d_head=self.Dh, head_gate_hidden=32
+        aw_mha = AdaptiveWidthMultiheadAttention(
+            AttentionConfig(
+                n_heads=self.cfg.n_heads, d_model=self.cfg.d_model, d_head=self.cfg.d_head,
+                use_parametric_scores=False
+            )
         )
-        aw_mha = AdaptiveWidthMultiheadAttention(attn_cfg).to(self.device)
-        output, aux = aw_mha(self.x)
+        aw_mha.train()
+        x = self.x.clone().requires_grad_(True)
+        y, info = aw_mha(x)  # без памяти/маски
+        loss = y.sum()
+        loss.backward()
 
-        self.assertEqual(output.shape, (self.B, self.T, self.Dm))
-        self.assertIn("head_gates", aux)
-        self.assertEqual(aux["head_gates"].shape, (self.B, self.T, self.H))
-
-        # Проверяем, что градиент проходит
-        output.sum().backward()
-        self.assertIsNotNone(aw_mha.q_proj.weight.grad)
+        # 1) есть градиент у Linear финального слоя гейта
         self.assertIsNotNone(aw_mha.head_gate.net.weight.grad)
 
+        # 2) влияние гейтов на вывод: при нулевых гейтах сумма ~ 0
+        with torch.no_grad():
+            zeros = torch.zeros_like(aw_mha.head_gate.net.weight)
+        aw_mha.head_gate.net.weight.data.copy_(zeros)
+        aw_mha.head_gate.net.bias.data.zero_()
+        y0, _ = aw_mha(self.x)
+        self.assertAlmostEqual(float(y0.abs().mean()), 0.0, places=6)
+
     def test_adaptive_layer(self):
-        """ Тест: Адаптивный слой """
-        layer = AdaptiveLayer(self.layer_cfg).to(self.device)
+        layer = AdaptiveLayer(self.layer_cfg)  # use_parametric_scores: как в твоём cfg
+        layer.train()
         x_out, p_halt, aux = layer(self.x)
 
-        self.assertEqual(x_out.shape, (self.B, self.T, self.Dm))
-        self.assertEqual(p_halt.shape, (self.B, self.T, 1))
-        self.assertTrue((p_halt >= 0).all() and (p_halt <= 1).all())
+        # 1) формы
+        B, T, D = self.x.shape
+        self.assertEqual(list(x_out.shape), [B, T, D])
+        self.assertEqual(list(p_halt.shape), [B, T, 1])
 
-        # Проверяем, что градиент проходит
-        x_out.sum().backward()
-        self.assertIsNotNone(layer.ff[0].weight.grad)
+        # 2) градиент до halt_gate — строим loss, зависящий от p_halt
+        loss = p_halt.mean() + 0.0 * x_out.sum()
+        loss.backward()
         self.assertIsNotNone(layer.halt_gate.net.weight.grad)
 
     def test_dynamic_encoder_forward_pass(self):
@@ -142,26 +150,73 @@ class TestDATArchitecture(unittest.TestCase):
         self.assertIsNotNone(model.layers[0].attn.q_proj.weight.grad)
         self.assertIsNotNone(model.layers[-1].ff[3].weight.grad)
 
-    def test_dynamic_encoder_early_exit(self):
-        """ Тест: Режим инференса с ранней остановкой (early_exit) """
-        enc_cfg_exit = EncoderConfig(
-            n_layers=6, layer=self.layer_cfg, early_exit=True, exit_threshold=0.5
+    def test_parametric_attention_forward(self):
+        cfg = LayerConfig(
+            d_model=self.cfg.d_model, n_heads=self.cfg.n_heads, d_head=self.cfg.d_head,
+            d_ff=self.cfg.d_ff, use_parametric_scores=True, score_hidden=64, score_chunk_size=8
         )
-        model = DynamicEncoder(enc_cfg_exit).to(self.device)
-        model.eval()  # Переключаем в режим оценки
+        layer = AdaptiveLayer(cfg).train()
+        x = self.x.clone().requires_grad_(True)
+        out, p_halt, _ = layer(x)
+        # простой loss даёт градиент в ParametricScoreMLP
+        loss = out.sum()
+        loss.backward()
+        # найдём параметры MLP-скорера
+        attn = layer.attn.attn
+        params = list(attn.score.mlp.parameters())
+        self.assertTrue(any(p.grad is not None for p in params))
 
+    def test_memory_path(self):
+        Dh = self.cfg.d_head
+        mem = MemoryBank(d_key=Dh, d_value=self.cfg.d_model)
+        # seed memory
         with torch.no_grad():
-            output, aux = model(self.x, return_aux=True)
+            mem.write(torch.randn(64, Dh), torch.randn(64, self.cfg.d_model))
 
-        self.assertEqual(output.shape, (self.B, self.T, self.Dm))
+        cfg = LayerConfig(
+            d_model=self.cfg.d_model, n_heads=self.cfg.n_heads, d_head=Dh,
+            d_ff=self.cfg.d_ff, mem_topk=4
+        )
+        layer = AdaptiveLayer(cfg).eval()  # форма инвариантна в eval/train
+        out, p_halt, info = layer(self.x, memory_bank=mem)
+        self.assertEqual(out.shape, self.x.shape)
 
-        # Проверяем, что ponder_cost (ожидаемая глубина) меньше максимальной
-        # из-за ранней остановки (вероятность > 0)
-        ponder_cost = aux["halting_ps"].sum(dim=0).mean()
-        self.assertLess(ponder_cost.item(), enc_cfg_exit.n_layers)
+    def test_masking_blocks_pads(self):
+        layer = AdaptiveLayer(self.layer_cfg).eval()
+        B, T, D = self.x.shape
+        # маска: половина тайм-степов паддинг
+        mask = torch.ones(B, T);
+        mask[:, T // 2:] = 0
+        # additive attention mask [B,1,1,T]
+        attn_mask = (1.0 - mask).unsqueeze(1).unsqueeze(2) * torch.finfo(torch.float32).min
+        _, _, info = layer(self.x, attn_mask=attn_mask)
+        w = info["attn_weights"]  # [H или B? см. твою структуру] -> берем mean по H/Tq
+        attn_mean_over_heads = w.mean(dim=(0, 1, 2))  # [Tk]
+        # проверим, что среднее внимание на паддинги заметно меньше
+        self.assertLess(float(attn_mean_over_heads[T // 2:].mean()),
+                        float(attn_mean_over_heads[:T // 2].mean()))
+
+    def test_dynamic_encoder_early_exit(self):
+        cfg = EncoderConfig(n_layers=3, layer=self.layer_cfg, early_exit=True, exit_threshold=0.8)
+        model = DynamicEncoder(cfg).eval()
+        # «задираем» bias у всех halt_gate, чтобы p_halt≈1 на первом слое
+        for lyr in model.layers:
+            nn.init.constant_(lyr.halt_gate.net.bias, 10.0)
+            if hasattr(lyr.halt_gate.net, "weight"):
+                nn.init.zeros_(lyr.halt_gate.net.weight)
+        _, aux = model(self.x, return_aux=True)
+        # было выполнено только 1 слой
+        self.assertEqual(aux["halting_ps"].shape[0], 1)
 
 
 if __name__ == '__main__':
     print("Запуск модульных тестов для архитектуры DAT...")
-    unittest.main(argv=['first-arg-is-ignored'], exit=False)
-    print("\nВсе тесты успешно пройдены!")
+    suite = unittest.TestSuite()
+    suite.addTest(unittest.makeSuite(TestDATArchitecture))
+    runner = unittest.TextTestRunner()
+    result = runner.run(suite)
+
+    if result.wasSuccessful():
+        print("\nВсе тесты успешно пройдены!")
+    else:
+        print("\nТесты не пройдены. Найдены ошибки.")

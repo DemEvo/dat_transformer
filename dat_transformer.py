@@ -64,22 +64,25 @@ def _merge_heads(x: torch.Tensor) -> torch.Tensor:
 class GatingMLP(nn.Module):
     """Generic sigmoid gate. Returns values in [0, 1].
 
-    If hidden_dim is provided, uses a 2‑layer MLP with GELU; else a single Linear.
+    If hidden_dim is provided, uses a 2-layer MLP with GELU; else a single Linear.
     """
 
     def __init__(self, d_in: int, d_out: int = 1, hidden_dim: Optional[int] = None):
         super().__init__()
         if hidden_dim is None:
-            self.net = nn.Linear(d_in, d_out)
+            self.pre = None
+            self.net = nn.Linear(d_in, d_out)           # <- всегда Linear
         else:
-            self.net = nn.Sequential(
+            self.pre = nn.Sequential(
                 nn.Linear(d_in, hidden_dim),
                 nn.GELU(),
-                nn.Linear(hidden_dim, d_out),
             )
+            self.net = nn.Linear(hidden_dim, d_out)     # <- финальный Linear c .weight
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.sigmoid(self.net(x))
+        h = x if getattr(self, "pre", None) is None else self.pre(x)
+        return torch.sigmoid(self.net(h))
+
 
 
 class ParametricScoreMLP(nn.Module):
@@ -267,11 +270,12 @@ class MemoryAugmentedAttention(nn.Module):
             if self.score is None:
                 scores = torch.matmul(q_t, k_cat.transpose(-2, -1)) / math.sqrt(Dh)  # [B,H,1,Tk_aug]
             else:
+                # Правильно: считаем пары для одного запроса q_t (Tq=1)
                 scores = self.score.pairwise_scores(
-                    q_t.expand(-1, -1, k_cat.shape[2], -1),  # [B,H,Tk_aug,Dh]
-                    k_cat,
+                    q_t,  # [B,H,1,Dh]
+                    k_cat,  # [B,H,Tk_aug,Dh]
                     self.cfg.score_chunk_size,
-                ).unsqueeze(2)  # [B,H,1,Tk_aug]
+                )  # -> [B,H,1,Tk_aug]
 
             if attn_mask is not None:
                 # Slice mask for current query timestep if provided per sequence
