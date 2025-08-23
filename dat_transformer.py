@@ -222,6 +222,9 @@ class MemoryAugmentedAttention(nn.Module):
         q_for_mem: Optional[torch.Tensor] = None,  # [B,Tq,Dh] (aggregated across heads)
         attn_mask: Optional[torch.Tensor] = None,  # [B,1,Tq,Tk_aug] (additive -inf mask)
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if attn_mask is not None and attn_mask.device != q.device:
+            attn_mask = attn_mask.to(q.device)
+
         B, H, Tq, Dh = q.shape
         Tk = k_ctx.shape[2]
 
@@ -320,6 +323,12 @@ class AdaptiveWidthMultiheadAttention(nn.Module):
         memory_bank: Optional[MemoryBank] = None,
         inference_prune: bool = False,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        # device guard
+        if self.q_proj.weight.device != x.device:
+            self.to(x.device)
+        if attn_mask is not None and attn_mask.device != x.device:
+            attn_mask = attn_mask.to(x.device)
+
         B, T, Dm = x.shape
         H, Dh = self.cfg.n_heads, self.cfg.d_head
 

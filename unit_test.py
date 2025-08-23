@@ -118,9 +118,19 @@ class TestDATArchitecture(unittest.TestCase):
         self.assertAlmostEqual(float(y0.abs().mean()), 0.0, places=6)
 
     def test_adaptive_layer(self):
-        layer = AdaptiveLayer(self.layer_cfg)  # use_parametric_scores: как в твоём cfg
+        cfg = LayerConfig(
+            d_model=self.Dm, n_heads=self.H, d_head=self.Dh, d_ff=4 * self.Dm,
+            head_gate_hidden=32, halt_gate_hidden=32,
+            use_parametric_scores=True, score_hidden=64, score_chunk_size=8,
+            mem_topk=0,
+        )
+        layer = AdaptiveLayer(cfg).to(self.device)
         layer.train()
         x_out, p_halt, aux = layer(self.x)
+        loss = x_out.sum() + 1e-3 * p_halt.mean()  # добавили мягкую зависимость
+        loss.backward()
+        self.assertIsNotNone(layer.ff[0].weight.grad)
+        self.assertIsNotNone(layer.halt_gate.net.weight.grad)
 
         # 1) формы
         B, T, D = self.x.shape
