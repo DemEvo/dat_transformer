@@ -21,9 +21,9 @@ import torch
 import torch.nn as nn
 
 # --- Импорт архитектуры DAT ---
-# Убедитесь, что dat_core.py находится в той же папке
+# Убедитесь, что dat_transformer.py находится в той же папке
 try:
-    from dat_transformer import (
+    from dat_transformer_v2 import (
         GatingMLP,
         ParametricScoreMLP,
         MemoryBank,

@@ -13,6 +13,7 @@ edu_experiment_min.py — минимальный, самодостаточный
 import math
 import random
 import time
+from types import SimpleNamespace
 from dataclasses import dataclass
 from typing import List, Tuple
 
@@ -52,15 +53,15 @@ VOCAB = {
     3: ")",
 }
 VOCAB_SIZE = max(VOCAB.keys()) + 1
-MAX_LEN = 64             # включая CLS
+MAX_LEN = 128             # включая CLS
 N_CLASSES = 2            # сбалансировано/нет
 
 
 # размеры маленьких сетей
 MODEL_D = 32
-MODEL_HEADS = 2
+MODEL_HEADS = 4
 MODEL_LAYERS = 4
-D_FF = 2 * MODEL_D
+D_FF = 4 * MODEL_D
 
 # обучение
 @dataclass
@@ -149,6 +150,13 @@ def pad_to_len(ids: List[int], L: int) -> List[int]:
         return ids[:L]
     return ids + [PAD_TOKEN] * (L - len(ids))
 
+def _get_n_layers(encoder, default_layers: int = MODEL_LAYERS) -> int:
+    if hasattr(encoder, "n_layers"):
+        return int(encoder.n_layers)
+    cfg = getattr(encoder, "cfg", None)
+    if cfg is not None and hasattr(cfg, "n_layers"):
+        return int(cfg.n_layers)
+    return int(default_layers)
 
 def build_dataset(n_train=8000, n_val=2000, n_test=2000, min_len=10, max_len=40, seed=SEED):
     rng = random.Random(seed)
@@ -199,6 +207,8 @@ class BaselineEncoder(nn.Module):
         )
         self.enc = nn.TransformerEncoder(layer, num_layers=n_layers)
         self.ln = nn.LayerNorm(d_model)
+        self.n_layers = n_layers
+        self.cfg = SimpleNamespace(n_layers=n_layers)
 
     def forward(self, x: torch.Tensor, key_padding_mask: torch.Tensor = None, return_aux: bool = True):
         # key_padding_mask: [B, T] (True=игнорировать)
@@ -247,6 +257,52 @@ class SequenceClassifier(nn.Module):
 # =========================
 # Обучение / Оценка
 # =========================
+@torch.no_grad()
+def _avg_depth_from_aux(aux, L: int) -> float:
+    """Ожидаемая глубина по батчу. Для Baseline вернём L."""
+    if not isinstance(aux, dict):
+        return float(L)
+    hp = aux.get("halting_ps", None)  # ожидаем [L,B,T,1] или список длины L
+    if isinstance(hp, torch.Tensor) and hp.dim() >= 3:
+        # [L,B,T,1] -> суммируем по слоям и усредняем по B,T
+        exp_layers = hp.sum(dim=0)  # [B,T,1]
+        return float(exp_layers.mean().item())
+    if isinstance(hp, (list, tuple)) and len(hp) > 0 and isinstance(hp[0], torch.Tensor):
+        # список p_i [B,T,1]
+        exp_layers = torch.stack(hp, dim=0).sum(dim=0).mean()
+        return float(exp_layers.item())
+    return float(L)
+
+def _batch_acc(logits: torch.Tensor, y: torch.Tensor) -> float:
+    return float((logits.argmax(dim=-1) == y).float().mean().item())
+
+@torch.no_grad()
+def evaluate_split(model, data_tuple, criterion, batch_size=512, device=None):
+    """Вычисляем val-loss/acc и среднюю глубину на датасете (tuple из (seqs, labels, complexity))."""
+    device = device or next(model.parameters()).device
+    model.eval()
+    X, Y, _ = data_tuple
+    N = Y.size(0)
+    total_loss = 0.0
+    total_correct = 0
+    total_count = 0
+    depth_sum = 0.0
+    for i in range(0, N, batch_size):
+        xb = X[i:i+batch_size].to(device)
+        yb = Y[i:i+batch_size].to(device)
+        logits, aux = model(xb, return_aux=True)
+        loss = criterion(logits, yb)
+        total_loss += float(loss.item()) * yb.size(0)
+        total_correct += int((logits.argmax(-1) == yb).sum().item())
+        total_count += int(yb.size(0))
+        depth_sum += _avg_depth_from_aux(aux, _get_n_layers(model.encoder)) * yb.size(0)
+
+    return {
+        "loss": total_loss / max(1, total_count),
+        "acc": total_correct / max(1, total_count),
+        "avg_depth": depth_sum / max(1, total_count),
+    }
+
 def train_model(model: nn.Module, name: str, cfg: TrainerConfig, train_data, val_data):
     model.to(DEVICE).train()
     train_x, train_y, _ = train_data
@@ -275,6 +331,34 @@ def train_model(model: nn.Module, name: str, cfg: TrainerConfig, train_data, val
             logits, aux = model(xb, return_aux=True)
             loss = criterion(logits, yb)
 
+            # --- Deep Supervision: учим каждый слой классифицировать (только для DAT) ---
+            if isinstance(aux, dict) and "feats_per_layer" in aux and "halting_ps" in aux:
+                try:
+                    ps = aux["halting_ps"]
+                    if isinstance(ps, list):
+                        ps = torch.stack(ps, dim=0)   # [L,B,T,1]
+                    # Берём вероятность остановки по CLS-токену
+                    p_cls = ps[..., 0, 0]            # [L,B]
+                    L, B = p_cls.shape
+                    one_minus = (1.0 - p_cls)
+                    # w_i = p_i * Π_{j<i}(1-p_j)
+                    prefix = torch.ones(1, B, device=p_cls.device, dtype=p_cls.dtype)
+                    prod_prev = torch.cumprod(torch.cat([prefix, one_minus[:-1]], dim=0), dim=0)  # [L,B]
+                    w = p_cls * prod_prev
+                    w = w / (w.sum(dim=0, keepdim=True) + 1e-8)  # нормировка по батчу
+
+                    ds = 0.0
+                    for li, feats_i in enumerate(aux["feats_per_layer"]):
+                        logits_i = model.head(feats_i[:, 0, :])  # CLS
+                        ce_i = F.cross_entropy(logits_i, yb, reduction="none")  # [B]
+                        ds += (ce_i * w[li]).mean()
+                    # Смешиваем с основным лоссом (легко крутить 0.2–0.4)
+                    loss = 0.7 * loss + 0.3 * ds
+                except Exception:
+                    # на всякий — не роняем обучение, если что-то не так с aux
+                    pass
+            # ---------------------------------------------------------------------------
+
             # тёплый старт: первые 20% шагов выход практически запрещён
             if isinstance(getattr(model, "encoder", None), DynamicEncoder) and model.encoder.cfg.early_exit:
                 warm = int(cfg.max_steps * 0.2)
@@ -284,6 +368,42 @@ def train_model(model: nn.Module, name: str, cfg: TrainerConfig, train_data, val
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
+            # до цикла
+            log_every = 200  # как часто печатать свод
+            run_loss = run_correct = run_count = 0
+            run_depth_sum = 0.0
+
+            # внутри батч-цикла ПОСЛЕ optimizer.step()
+            run_loss += float(loss.item()) * yb.size(0)
+            run_correct += int((logits.argmax(-1) == yb).sum().item())
+            run_count += int(yb.size(0))
+
+            # средняя глубина на батч
+            L_enc = _get_n_layers(model.encoder)
+            if isinstance(getattr(model, "encoder", None), DynamicEncoder):
+                run_depth_sum += _avg_depth_from_aux(aux, L_enc) * yb.size(0)
+            else:
+                run_depth_sum += float(L_enc) * yb.size(0)
+
+            # каждые log_every шагов — валидационный замер + консоль
+            if (step + 1) % log_every == 0:
+                train_loss = run_loss / max(1, run_count)
+                train_acc = run_correct / max(1, run_count)
+                train_depth = run_depth_sum / max(1, run_count)
+
+                model.eval()
+                val_metrics = evaluate_split(model, val_data, criterion,
+                                             batch_size=cfg.batch_size, device=DEVICE)
+                model.train()
+
+                print(f"{name} | step {step + 1:>5} | "
+                      f"TRAIN loss {train_loss:.4f} acc {train_acc:.4f} depth {train_depth:.2f} | "
+                      f"VAL loss {val_metrics['loss']:.4f} acc {val_metrics['acc']:.4f} depth {val_metrics['avg_depth']:.2f}")
+
+                # сбросить окна усреднения
+                run_loss = run_correct = run_count = 0
+                run_depth_sum = 0.0
+
             step += 1
             if step - last_log >= cfg.log_every or step == cfg.max_steps:
                 pbar.set_description(f"{name} | step {step} | loss {loss.item():.3f}")
@@ -292,6 +412,38 @@ def train_model(model: nn.Module, name: str, cfg: TrainerConfig, train_data, val
             if step >= cfg.max_steps:
                 break
     pbar.close()
+
+    # --- Финальная сводка train vs val ---------------------------------------
+    model_was_train = model.training
+    model.eval()  # корректный режим для Dropout/Norm во время валидации
+    # (eval и no_grad вместе — так и принято: отключаем Autograd и слой/dropout-режимы)
+    # см. PyTorch best practice: использовать и eval(), и torch.no_grad() при валидации. [1][2]
+
+    # Для DAT: на оценке можно явно включить ранний выход, если ты так решил.
+    was_early = None
+    if isinstance(getattr(model, "encoder", None), DynamicEncoder):
+        was_early = model.encoder.cfg.early_exit
+        model.encoder.cfg.early_exit = True  # или оставь как есть — зависит от твоего протокола оценки
+
+    with torch.no_grad():
+        train_metrics = evaluate_split(model, train_data, criterion,
+                                       batch_size=cfg.batch_size, device=DEVICE)
+        val_metrics   = evaluate_split(model, val_data,   criterion,
+                                       batch_size=cfg.batch_size, device=DEVICE)
+
+    # Вернуть флаг раннего выхода как был
+    if isinstance(getattr(model, "encoder", None), DynamicEncoder) and was_early is not None:
+        model.encoder.cfg.early_exit = was_early
+
+    # Вернуть режим обучения, если нужно продолжать тренинг где-то дальше
+    if model_was_train:
+        model.train()
+
+    print(f"{name} | FINAL | "
+          f"TRAIN loss {train_metrics['loss']:.4f} acc {train_metrics['acc']:.4f} depth {train_metrics['avg_depth']:.2f} || "
+          f"VAL loss {val_metrics['loss']:.4f} acc {val_metrics['acc']:.4f} depth {val_metrics['avg_depth']:.2f}")
+    # --------------------------------------------------------------------------
+
 
 
 @torch.no_grad()
@@ -319,6 +471,9 @@ def evaluate_model(model: nn.Module, test_data):
         correct = 0
         total = 0
         times = []
+        depth_sum = 0.0
+        depth_count = 0
+
 
         for xb, yb in dl:
             xb = xb.to(DEVICE, non_blocking=True)
@@ -333,16 +488,16 @@ def evaluate_model(model: nn.Module, test_data):
             pred = logits.argmax(dim=-1)
             correct += (pred == yb).sum().item()
             total += yb.numel()
+            # накапливаем ожидаемую глубину по батчам (только для DAT)
+            if isinstance(model.encoder, DynamicEncoder) and isinstance(aux, dict):
+                ps = aux.get("halting_ps")
+                if isinstance(ps, list):
+                    ps = torch.stack(ps, dim=0)
+                if isinstance(ps, torch.Tensor):
+                    depth_sum += float(ps.sum(dim=0).mean().item()) * yb.size(0)
+                    depth_count += int(yb.size(0))
 
-        # глубина (только для DAT; если нет — None)
-        avg_depth = None
-        if isinstance(model.encoder, DynamicEncoder) and isinstance(aux, dict) and ("halting_ps" in aux):
-            # ожидаемая глубина = сумма p_halt по слоям
-            ps = aux["halting_ps"]  # ожидаем [L,B,T,1] или [L,B,1,1]
-            if isinstance(ps, list):  # иногда список по слоям
-                ps = torch.stack(ps, dim=0)
-            avg_depth = float(ps.sum(dim=0).mean().item())
-
+        avg_depth = (depth_sum / max(1, depth_count)) if depth_count > 0 else None
         acc = correct / max(1, total)
         avg_ms = (sum(times) / len(times)) * 1000.0
         return dict(acc=acc, avg_time_ms=avg_ms, depth=avg_depth)
@@ -448,7 +603,7 @@ def main():
         mem_topk=0,
         head_gate_hidden=None,  # ← отключили «ширину», чтобы не ломать маленькую сеть
         halt_gate_hidden=16,  # ← помягче для D=8
-        halt_bias_init=0.0,
+        halt_bias_init=-1.5,
         halt_from_cls=True,  # ← только для DAT на этой задаче
     )
 
@@ -456,7 +611,7 @@ def main():
         n_layers=MODEL_LAYERS,
         layer=dat_layer_cfg,
         early_exit=True,
-        exit_threshold=0.98,
+        exit_threshold=0.98
     )
     dat_encoder = DynamicEncoder(dat_enc_cfg)
     dat_model   = SequenceClassifier(dat_encoder, d_model=MODEL_D, n_classes=N_CLASSES)

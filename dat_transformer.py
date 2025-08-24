@@ -438,6 +438,7 @@ class AdaptiveLayer(nn.Module):
         )
         self.resid_drop = nn.Dropout(cfg.resid_dropout)
         self.halt_gate = GatingMLP(cfg.d_model, d_out=1, hidden_dim=cfg.halt_gate_hidden)
+        self.halt_ln = nn.LayerNorm(cfg.d_model)
         # Инициализация: высокий bias → p_halt стартует ~0.8
         nn.init.constant_(self.halt_gate.net.bias, cfg.halt_bias_init)
         nn.init.zeros_(self.halt_gate.net.weight)
@@ -458,12 +459,7 @@ class AdaptiveLayer(nn.Module):
         x = x + self.resid_drop(ff_out)
         x = self.ln2(x)
         # Halting per token
-        if getattr(self.cfg, "halt_from_cls", False):
-            p_cls = self.halt_gate(x[:, :1, :])  # [B,1,1]
-            p_halt = p_cls.expand(-1, x.size(1), -1)  # [B,T,1]
-        else:
-            p_halt = self.halt_gate(x)  # [B,T,1]
-        x = x + (p_halt - p_halt.detach())
+        p_halt = self.halt_gate(self.halt_ln(x))  # [B,T,1]
         return x, p_halt, attn_info
 
 
@@ -476,8 +472,9 @@ class EncoderConfig:
     layer: LayerConfig
     early_exit: bool = False
     exit_threshold: float = 0.9  # cumulative halting threshold at inference
+    min_layers_before_exit: int = 1
+    exit_patience: int = 0
     ponder_epsilon: float = 0.0  # optional ACT‑style regularizer weight
-
 
 class DynamicEncoder(nn.Module):
     """Stack with probabilistic halting fusion.
@@ -505,7 +502,13 @@ class DynamicEncoder(nn.Module):
 
         tokens_done = torch.zeros(B, T, 1, device=x.device, dtype=torch.bool)
 
-        aux = {"halting_ps": [], "head_gates": [], "attn_weights": []}
+        # patience/min-layers counters
+        patience = int(getattr(self.cfg, "exit_patience", 0) or 0)
+        min_layers = int(getattr(self.cfg, "min_layers_before_exit", 0) or 0)
+        pat_ctr = torch.zeros(B, T, 1, device=x.device, dtype=torch.long)
+        last_decision = torch.zeros(B, T, 1, device=x.device, dtype=torch.bool)
+
+        aux = {"halting_ps": [], "head_gates": [], "attn_weights": [], "feats_per_layer": []}
 
         for i, layer in enumerate(self.layers):
             inference_prune = self.cfg.early_exit
@@ -518,9 +521,18 @@ class DynamicEncoder(nn.Module):
             aux["halting_ps"].append(p_i)
             aux["head_gates"].append(attn_info.get("head_gates"))
             aux["attn_weights"].append(attn_info.get("attn_weights"))
+            aux["feats_per_layer"].append(x)  # <— сохраняем признаки слоя для глубокой супервизии
+            aux["feats_per_layer"].append(x)  # <— сохраняем признаки слоя для глубокой супервизии
 
             if self.cfg.early_exit:
-                tokens_done = tokens_done | (1.0 - remaining >= self.cfg.exit_threshold)
+                cum = (1.0 - remaining)
+                decision = (cum >= self.cfg.exit_threshold)
+                same = (decision == last_decision)
+                pat_ctr = torch.where(same, pat_ctr + 1, torch.zeros_like(pat_ctr))
+                last_decision = decision
+                can_exit = (i + 1) >= min_layers
+                patience_ok = (pat_ctr >= patience) if patience > 0 else torch.ones_like(pat_ctr, dtype=torch.bool)
+                tokens_done = tokens_done | (decision & can_exit & patience_ok)
                 if bool(tokens_done.all()):
                     break
 
