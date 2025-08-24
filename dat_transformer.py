@@ -229,7 +229,7 @@ class MemoryAugmentedAttention(nn.Module):
             attn_mask = attn_mask.to(q.device)
 
         B, H, Tq, Dh = q.shape
-        Tk = k_ctx.shape[2]
+        # Tk = k_ctx.shape[2]
 
         # Retrieve + augment
         if memory_bank is not None and self.cfg.mem_topk > 0 and q_for_mem is not None:
