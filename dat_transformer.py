@@ -409,6 +409,7 @@ class LayerConfig:
     prune_heads_threshold: Optional[float] = None
     halt_gate_hidden: Optional[int] = None
     halt_bias_init: float = 1.5  # sigmoid(1.5)≈0.82, помогает раннему выходу
+    halt_temp: float = 1.0       # температура для p_halt (1.0 = как было)
     halt_from_cls: bool = False
 
 class AdaptiveLayer(nn.Module):
@@ -458,8 +459,24 @@ class AdaptiveLayer(nn.Module):
         ff_out = self.ff(x)
         x = x + self.resid_drop(ff_out)
         x = self.ln2(x)
-        # Halting per token
-        p_halt = self.halt_gate(self.halt_ln(x))  # [B,T,1]
+
+        # Halting gate
+        # Если хотим решать "останавливаемся/нет" по CLS, берём один логит и растянем по T
+        if self.cfg.halt_from_cls:
+            x_gate = x[:, :1, :]                           # [B,1,D]
+            p_halt = self.halt_gate(self.halt_ln(x_gate))  # [B,1,1]
+            p_halt = p_halt.expand(x.size(0), x.size(1), 1)  # [B,T,1]
+        else:
+            p_halt = self.halt_gate(self.halt_ln(x))       # [B,T,1]
+
+        # Температура для устойчивости порога
+        tau = getattr(self.cfg, "halt_temp", 1.0)
+        if tau != 1.0:
+            eps = 1e-6
+            p_safe = p_halt.clamp(eps, 1.0 - eps)
+            logit = torch.log(p_safe) - torch.log(1.0 - p_safe)
+            p_halt = torch.sigmoid(logit / tau)
+
         return x, p_halt, attn_info
 
 
@@ -545,8 +562,13 @@ class DynamicEncoder(nn.Module):
             # You can add this to loss: L += epsilon * mean(ponder_cost)
             aux["ponder_cost"] = ponder_cost.mean()
 
-        aux["halting_ps"] = torch.stack(aux["halting_ps"], dim=0)  # [L,B,T,1]
-        return (weighted_sum, aux) if return_aux else (weighted_sum, {})
+        if return_aux:
+            # Стэкаем halting_ps один раз — в конец.
+            if isinstance(aux["halting_ps"], list):
+                aux["halting_ps"] = torch.stack(aux["halting_ps"], dim=0)  # [L,B,T,1]
+            return (weighted_sum, aux)
+        else:
+            return (weighted_sum, {})
 
 
 # -----------------------------

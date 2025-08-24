@@ -23,7 +23,7 @@ import torch.nn as nn
 # --- Импорт архитектуры DAT ---
 # Убедитесь, что dat_transformer.py находится в той же папке
 try:
-    from dat_transformer_v2 import (
+    from dat_transformer import (
         GatingMLP,
         ParametricScoreMLP,
         MemoryBank,
@@ -36,7 +36,7 @@ try:
         EncoderConfig
     )
 except ImportError:
-    print("Ошибка: файл dat_core.py не найден. Пожалуйста, поместите его в ту же директорию.")
+    print("Ошибка: файл dat_transformer.py не найден. Пожалуйста, поместите его в ту же директорию.")
     exit()
 
 

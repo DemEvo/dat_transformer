@@ -53,15 +53,15 @@ VOCAB = {
     3: ")",
 }
 VOCAB_SIZE = max(VOCAB.keys()) + 1
-MAX_LEN = 128             # включая CLS
+MAX_LEN = 64             # включая CLS
 N_CLASSES = 2            # сбалансировано/нет
 
 
 # размеры маленьких сетей
-MODEL_D = 32
-MODEL_HEADS = 4
+MODEL_D = 64
+MODEL_HEADS = 2
 MODEL_LAYERS = 4
-D_FF = 4 * MODEL_D
+D_FF = 3 * MODEL_D
 
 # обучение
 @dataclass
@@ -305,17 +305,18 @@ def evaluate_split(model, data_tuple, criterion, batch_size=512, device=None):
 
 def train_model(model: nn.Module, name: str, cfg: TrainerConfig, train_data, val_data):
     model.to(DEVICE).train()
-    train_x, train_y, _ = train_data
+    train_x, train_y, train_d = train_data
     val_x, val_y, _ = val_data
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=0.01)
     criterion = nn.CrossEntropyLoss()
 
-    # DataLoader (фикс. длина, так что можно без кастомного collate)
+    # DataLoader (фикс. длина, так что можно без кастомного collate); включаем сложность в батч
     kwargs = {}
     if DEVICE.type == "cuda":
         kwargs = dict(num_workers=2, pin_memory=True)
-    train_ds = TensorDataset(train_x, train_y)
+    # включим сложность в батч (для бюджет-регуляции глубины только в DAT)
+    train_ds = TensorDataset(train_x, train_y, train_d)
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, **kwargs)
 
     print(f"\n--- Обучение модели: {name} ---")
@@ -323,9 +324,10 @@ def train_model(model: nn.Module, name: str, cfg: TrainerConfig, train_data, val
     last_log = 0
     pbar = tqdm(total=cfg.max_steps, mininterval=0.1)
     while step < cfg.max_steps:
-        for xb, yb in train_loader:
+        for xb, yb, db in train_loader:
             xb = xb.to(DEVICE, non_blocking=True)
             yb = yb.to(DEVICE, non_blocking=True)
+            db = db.to(DEVICE, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
             # просим aux для DAT
             logits, aux = model(xb, return_aux=True)
@@ -353,23 +355,41 @@ def train_model(model: nn.Module, name: str, cfg: TrainerConfig, train_data, val
                         ce_i = F.cross_entropy(logits_i, yb, reduction="none")  # [B]
                         ds += (ce_i * w[li]).mean()
                     # Смешиваем с основным лоссом (легко крутить 0.2–0.4)
-                    loss = 0.7 * loss + 0.3 * ds
+                    loss = 0.5 * loss + 0.5 * ds
                 except Exception:
                     # на всякий — не роняем обучение, если что-то не так с aux
                     pass
             # ---------------------------------------------------------------------------
+            # --- Difficulty-aware бюджет глубины ---
+            # exp_depth ~= sum_i p_halt_i; целевую глубину зададим линейно от сложности.
+            if isinstance(aux, dict) and "halting_ps" in aux:
+                ps = aux["halting_ps"]
+                if isinstance(ps, list):
+                    ps = torch.stack(ps, dim=0)  # [L,B,T,1]
+                # ожидаемая глубина по сэмплу (средняя по токенам)
+                exp_depth_b = ps.sum(dim=0).mean(dim=1).squeeze(-1)  # [B]
+                L = _get_n_layers(model.encoder)
+                # сложность db (макс. вложенность) приводим к [1..L]
+                tgt = 1.0 + (db.float().clamp(0, 8) / 8.0) * max(L - 1, 1)  # [B]
+                loss_depth = F.mse_loss(exp_depth_b, tgt)
+                loss = loss + 0.05 * loss_depth
 
             # тёплый старт: первые 20% шагов выход практически запрещён
             if isinstance(getattr(model, "encoder", None), DynamicEncoder) and model.encoder.cfg.early_exit:
                 warm = int(cfg.max_steps * 0.2)
-                model.encoder.cfg.exit_threshold = 1.2 if step < warm else 0.98
+                # минимум слоёв до выхода + терпение по стабильности логитов (если поддерживается)
+                if hasattr(model.encoder.cfg, "min_layers_before_exit"):
+                    model.encoder.cfg.min_layers_before_exit = 2
+                if hasattr(model.encoder.cfg, "exit_patience"):
+                    model.encoder.cfg.exit_patience = 1
+                model.encoder.cfg.exit_threshold = 1.5 if step < warm else 0.98
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
             # до цикла
-            log_every = 200  # как часто печатать свод
+            log_every = 501  # как часто печатать свод
             run_loss = run_correct = run_count = 0
             run_depth_sum = 0.0
 
@@ -604,14 +624,18 @@ def main():
         head_gate_hidden=None,  # ← отключили «ширину», чтобы не ломать маленькую сеть
         halt_gate_hidden=16,  # ← помягче для D=8
         halt_bias_init=-1.5,
-        halt_from_cls=True,  # ← только для DAT на этой задаче
+        halt_from_cls=True,   # ← p_halt от CLS
+        halt_temp=1.3,  # ← чуть сгладим сигмоиду останова
     )
 
     dat_enc_cfg = EncoderConfig(
         n_layers=MODEL_LAYERS,
         layer=dat_layer_cfg,
         early_exit=True,
-        exit_threshold=0.98
+        exit_threshold=0.98,
+        # → тонкая настройка выхода (если поля поддерживаются в твоём EncoderConfig):
+        min_layers_before_exit=2,
+        exit_patience=1
     )
     dat_encoder = DynamicEncoder(dat_enc_cfg)
     dat_model   = SequenceClassifier(dat_encoder, d_model=MODEL_D, n_classes=N_CLASSES)
@@ -625,7 +649,7 @@ def main():
 
     # 5) Оценка (включим ранний выход только на инференсе)
     if isinstance(dat_model.encoder, DynamicEncoder):
-        dat_model.encoder.cfg.early_exit = False # Флаг раннего выхода True False
+        dat_model.encoder.cfg.early_exit = True # Флаг раннего выхода True False
 
     base_res = evaluate_model(baseline_model, test_data)
     dat_res  = evaluate_model(dat_model, test_data)
