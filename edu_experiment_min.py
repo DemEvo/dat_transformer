@@ -1,4 +1,3 @@
-
 """
 edu_experiment_min.py — минимальный, самодостаточный эксперимент
 с маленькими сетками: Baseline Transformer vs DAT (DynamicEncoder).
