@@ -212,6 +212,9 @@ class MemoryAugmentedAttention(nn.Module):
         else:
             self.score = None
         self.dropout = nn.Dropout(cfg.dropout_p)
+        # ленивые проекции для памяти (на случай Dk/Dv != Dh)
+        self.mem_k_proj = None
+        self.mem_v_proj = None
 
     def forward(
         self,
@@ -230,17 +233,23 @@ class MemoryAugmentedAttention(nn.Module):
 
         # Retrieve + augment
         if memory_bank is not None and self.cfg.mem_topk > 0 and q_for_mem is not None:
-            K_mem, V_mem = memory_bank.retrieve(q_for_mem, self.cfg.mem_topk)  # [B,Tq,K,Dh]
+            K_mem, V_mem = memory_bank.retrieve(q_for_mem, self.cfg.mem_topk)  # [B,Tq,K,Dk],[B,Tq,K,Dv]
+            # ── Приводим размеры памяти к Dh, если нужно ─────────────────────
+            Dk_in = K_mem.shape[-1]
+            Dv_in = V_mem.shape[-1]
+            if Dk_in != Dh:
+                if self.mem_k_proj is None or self.mem_k_proj.in_features != Dk_in:
+                    self.mem_k_proj = nn.Linear(Dk_in, Dh, bias=False).to(q.device)
+                K_mem = self.mem_k_proj(K_mem)  # [B,Tq,K,Dh]
+            if Dv_in != Dh:
+                if self.mem_v_proj is None or self.mem_v_proj.in_features != Dv_in:
+                    self.mem_v_proj = nn.Linear(Dv_in, Dh, bias=False).to(q.device)
+                V_mem = self.mem_v_proj(V_mem)  # [B,Tq,K,Dh]
+            # ─────────────────────────────────────────────────────────────────
             # Tile across heads
             K_mem = K_mem.unsqueeze(1).expand(B, H, Tq, self.cfg.mem_topk, Dh)
             V_mem = V_mem.unsqueeze(1).expand(B, H, Tq, self.cfg.mem_topk, Dh)
-            # Append along key length axis
-            k_aug = torch.cat([k_ctx, K_mem.transpose(2, 3)], dim=2)  # [B,H,Tk+K,Tq,Dh] -> fix below
-            v_aug = torch.cat([v_ctx, V_mem.transpose(2, 3)], dim=2)
-            # However we need k_aug/v_aug to be [B,H,Tk_aug,Dh]. Current layout confusion; correct it:
-            # k_ctx: [B,H,Tk,Dh], K_mem: [B,H,Tq,TopK,Dh] -> we need keys shared across queries.
-            # A simple approach: flatten K_mem along Tq*TopK and use a distinct mask per query.
-            # For simplicity and correctness here, we'll do per‑query attention below without mixing Tq.
+            # Перейдём в per-query путь ниже (корректный для памяти)
             use_per_query_path = True
         else:
             K_mem = V_mem = None
