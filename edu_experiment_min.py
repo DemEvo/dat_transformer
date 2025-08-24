@@ -55,6 +55,7 @@ VOCAB_SIZE = max(VOCAB.keys()) + 1
 MAX_LEN = 64             # включая CLS
 N_CLASSES = 2            # сбалансировано/нет
 
+
 # размеры маленьких сетей
 MODEL_D = 32
 MODEL_HEADS = 2
