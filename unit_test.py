@@ -219,6 +219,24 @@ class TestDATArchitecture(unittest.TestCase):
         # было выполнено только 1 слой
         self.assertEqual(aux["halting_ps"].shape[0], 1)
 
+    def test_head_gate_disabled(self):
+        cfg = LayerConfig(
+            d_model=self.Dm, n_heads=self.H, d_head=self.Dh, d_ff=4 * self.Dm,
+            head_gate_hidden=None,  # выключаем гейтинг
+            halt_gate_hidden=32
+        )
+        aw = AdaptiveWidthMultiheadAttention(AttentionConfig(
+            n_heads=self.H, d_model=self.Dm, d_head=self.Dh, head_gate_hidden=None
+        )).to(self.device)
+        x = torch.randn(self.B, self.T, self.Dm, device=self.device, requires_grad=True)
+        out, info = aw(x)
+        self.assertEqual(out.shape, (self.B, self.T, self.Dm))
+        self.assertIsNone(info["head_gates"])
+        out.sum().backward()
+        # Проверяем, что градиенты вообще идут
+        for p in aw.parameters():
+            if p.requires_grad:
+                self.assertIsNotNone(p.grad)
 
 
 if __name__ == '__main__':

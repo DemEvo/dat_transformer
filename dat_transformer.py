@@ -191,12 +191,10 @@ class AttentionConfig:
     dropout_p: float = 0.0
     use_parametric_scores: bool = False
     score_hidden: int = 128
-    score_chunk_size: Optional[int] = None
-    mem_topk: int = 0  # 0 disables external memory
-    # Head gating
-    head_gate_hidden: Optional[int] = None
+    score_chunk_size: Optional[int] = None      # ← добавили
+    mem_topk: int = 0                            # ← добавили
+    head_gate_hidden: Optional[int] = 64
     prune_heads_threshold: Optional[float] = None  # inference only
-
 
 class MemoryAugmentedAttention(nn.Module):
     """Scaled attention over (context + retrieved memory).
@@ -321,8 +319,12 @@ class AdaptiveWidthMultiheadAttention(nn.Module):
         self.v_proj = nn.Linear(Dm, H * Dh, bias=False)
         self.o_proj = nn.Linear(H * Dh, Dm, bias=False)
         self.attn = MemoryAugmentedAttention(cfg)
-        # Per‑token per‑head gate: g = sigmoid(MLP(x)) -> [B,T,H]
-        self.head_gate = GatingMLP(Dm, d_out=H, hidden_dim=cfg.head_gate_hidden)
+        # Переключатель гейтинга голов
+        self.use_head_gate = (cfg.head_gate_hidden is not None)
+        # Per-token per-head gate: g = sigmoid(MLP(x)) -> [B,T,H]
+        # Если head_gate_hidden задан (в т.ч. по умолчанию), создаём гейт;
+        # если None — гейтинг отключён.
+        self.head_gate = GatingMLP(Dm, d_out=H, hidden_dim=cfg.head_gate_hidden) if self.use_head_gate else None
         self.dropout = nn.Dropout(cfg.dropout_p)
 
     def forward(
@@ -345,14 +347,18 @@ class AdaptiveWidthMultiheadAttention(nn.Module):
         k = _shape_proj(self.k_proj(x), H, Dh)
         v = _shape_proj(self.v_proj(x), H, Dh)
 
-        # Gates per token/head
-        gates = self.head_gate(x).clamp(0.0, 1.0)  # [B,T,H]
-        gates_h = gates.permute(0, 2, 1).unsqueeze(-1)  # [B,H,T,1]
+        # по умолчанию гейтинга нет
+        gates = None
+        if self.head_gate is None:  # или: if not self.use_head_gate:
+            gates_h = torch.ones(B, H, T, 1, device=x.device, dtype=x.dtype)
+        else:
+            gates = self.head_gate(x).clamp(0.0, 1.0)  # [B,T,H]
+            gates_h = gates.permute(0, 2, 1).unsqueeze(-1)  # [B,H,T,1]
 
         # Aggregate queries for memory retrieval (mean across heads)
         q_for_mem = q.mean(dim=1).contiguous()  # [B,T,Dh]
 
-        if inference_prune and self.cfg.prune_heads_threshold is not None:
+        if inference_prune and self.head_gate is not None and (self.cfg.prune_heads_threshold is not None):
             # Only compute heads whose avg gate across tokens >= threshold
             active = (gates.mean(dim=1) >= self.cfg.prune_heads_threshold)  # [B,H]
             # Fallback: if all pruned for a batch item, keep at least one head
@@ -402,7 +408,8 @@ class LayerConfig:
     mem_topk: int = 0
     prune_heads_threshold: Optional[float] = None
     halt_gate_hidden: Optional[int] = None
-
+    halt_bias_init: float = 1.5  # sigmoid(1.5)≈0.82, помогает раннему выходу
+    halt_from_cls: bool = False
 
 class AdaptiveLayer(nn.Module):
     def __init__(self, cfg: LayerConfig):
@@ -431,6 +438,9 @@ class AdaptiveLayer(nn.Module):
         )
         self.resid_drop = nn.Dropout(cfg.resid_dropout)
         self.halt_gate = GatingMLP(cfg.d_model, d_out=1, hidden_dim=cfg.halt_gate_hidden)
+        # Инициализация: высокий bias → p_halt стартует ~0.8
+        nn.init.constant_(self.halt_gate.net.bias, cfg.halt_bias_init)
+        nn.init.zeros_(self.halt_gate.net.weight)
 
     def forward(
         self,
@@ -448,7 +458,12 @@ class AdaptiveLayer(nn.Module):
         x = x + self.resid_drop(ff_out)
         x = self.ln2(x)
         # Halting per token
-        p_halt = self.halt_gate(x)  # [B,T,1]
+        if getattr(self.cfg, "halt_from_cls", False):
+            p_cls = self.halt_gate(x[:, :1, :])  # [B,1,1]
+            p_halt = p_cls.expand(-1, x.size(1), -1)  # [B,T,1]
+        else:
+            p_halt = self.halt_gate(x)  # [B,T,1]
+        x = x + (p_halt - p_halt.detach())
         return x, p_halt, attn_info
 
 
