@@ -19,6 +19,7 @@
 """
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -210,6 +211,8 @@ class TrainerConfig:
     learning_rate: float = 3e-4
     log_every: int = 100
     eval_every: int = 500
+    deep_supervision: bool = False
+    ds_alpha: float = 0.2
 
 
 def pad_sequences(sequences, max_len=None):
@@ -264,8 +267,39 @@ def train(model, model_name, config, train_data, val_data):
             if isinstance(model.encoder, DynamicEncoder):
                 logits, aux = model(tokens, return_aux=True)
                 loss = loss_fn(logits, labels)
-                if model.encoder.cfg.layer.halt_gate_hidden is not None:
-                    depth_penalty = 0.005 * aux['halting_ps'].sum(dim=0).mean()
+                # Optional Deep Supervision
+                if getattr(config, 'deep_supervision', False):
+                    try:
+                        ps = aux.get('halting_ps') if isinstance(aux, dict) else None
+                        feats_list = aux.get('feats_per_layer') if isinstance(aux, dict) else None
+                        if ps is not None and feats_list is not None and len(feats_list) > 0:
+                            if isinstance(ps, list):
+                                ps_t = torch.stack(ps, dim=0)  # [L,B,T,1]
+                            else:
+                                ps_t = ps
+                            # Use CLS token halting probs
+                            p_cls = ps_t[..., 0, 0]  # [L,B]
+                            L, B = p_cls.shape
+                            one_minus = (1.0 - p_cls)
+                            prefix = torch.ones(1, B, device=p_cls.device, dtype=p_cls.dtype)
+                            prod_prev = torch.cumprod(torch.cat([prefix, one_minus[:-1]], dim=0), dim=0)
+                            w = p_cls * prod_prev  # [L,B]
+                            w = w / (w.sum(dim=0, keepdim=True) + 1e-8)
+                            ds_loss = 0.0
+                            for li, feats_i in enumerate(feats_list):
+                                logits_i = model.head(feats_i[:, 0, :])  # CLS token at index 0
+                                ce_i = F.cross_entropy(logits_i, labels, reduction='none')  # [B]
+                                ds_loss = ds_loss + (ce_i * w[li]).mean()
+                            alpha = float(getattr(config, 'ds_alpha', 0.2))
+                            loss = (1.0 - alpha) * loss + alpha * ds_loss
+                    except Exception:
+                        pass
+                # Optional small depth penalty to encourage halting calibration
+                if model.encoder.cfg.layer.halt_gate_hidden is not None and isinstance(aux, dict) and 'halting_ps' in aux:
+                    ps = aux['halting_ps']
+                    if isinstance(ps, list):
+                        ps = torch.stack(ps, dim=0)
+                    depth_penalty = 0.005 * ps.sum(dim=0).mean()
                     loss += depth_penalty
             else:
                 logits = model(tokens)
@@ -344,7 +378,12 @@ def evaluate(model, test_data):
         total_count += total
 
         if isinstance(model.encoder, DynamicEncoder):
-            depth = aux.get('halting_ps').sum(dim=0).mean().item()
+            ps = aux.get('halting_ps') if isinstance(aux, dict) else None
+            if isinstance(ps, list):
+                ps_t = torch.stack(ps, dim=0)
+            else:
+                ps_t = ps
+            depth = ps_t.sum(dim=0).mean().item() if ps_t is not None else model.encoder.n_layers
         else:
             depth = model.encoder.n_layers
 
@@ -367,8 +406,9 @@ def evaluate(model, test_data):
 if __name__ == "__main__":
     NUM_SAMPLES = 25000
     MODEL_D = 256
-    MODEL_LAYERS = 6
     MODEL_HEADS = 4
+    MODEL_LAYERS = 6
+    D_FF = 4 * MODEL_D
 
     TRAIN_CONFIG = TrainerConfig(max_steps=8000, batch_size=128, learning_rate=3e-4, log_every=100, eval_every=400)
 
@@ -391,7 +431,7 @@ if __name__ == "__main__":
         torch.save(test_data, "test_data_brackets.pt")
 
     print("\n--- Обучение Baseline (Классический Трансформер) ---")
-    baseline_encoder = BaselineEncoder(n_layers=MODEL_LAYERS, d_model=MODEL_D, n_heads=MODEL_HEADS, d_ff=4 * MODEL_D)
+    baseline_encoder = BaselineEncoder(n_layers=MODEL_LAYERS, d_model=MODEL_D, n_heads=MODEL_HEADS, d_ff=D_FF)
     baseline_model = SequenceClassifier(baseline_encoder, d_model=MODEL_D, n_classes=N_CLASSES)
     baseline_model = train(baseline_model, "Baseline", TRAIN_CONFIG, train_data, val_data)
     print("\n--- Оценка Baseline ---")
@@ -399,7 +439,7 @@ if __name__ == "__main__":
 
     print("\n--- Обучение DAT ---")
     dat_layer_cfg = LayerConfig(
-        d_model=MODEL_D, n_heads=MODEL_HEADS, d_head=MODEL_D // MODEL_HEADS, d_ff=4 * MODEL_D,
+        d_model=MODEL_D, n_heads=MODEL_HEADS, d_head=MODEL_D // MODEL_HEADS, d_ff=D_FF,
         halt_gate_hidden=64, head_gate_hidden=None  # Отключаем адаптивную ширину для чистоты эксперимента
     )
     dat_enc_cfg = EncoderConfig(n_layers=MODEL_LAYERS, layer=dat_layer_cfg, early_exit=True, exit_threshold=0.95)

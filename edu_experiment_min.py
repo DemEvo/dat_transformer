@@ -618,7 +618,7 @@ def main():
         d_model=MODEL_D,
         n_heads=MODEL_HEADS,
         d_head=MODEL_D // MODEL_HEADS,
-        d_ff=4 * MODEL_D,
+        d_ff=D_FF,
         use_parametric_scores=False,
         mem_topk=0,
         head_gate_hidden=None,  # ← отключили «ширину», чтобы не ломать маленькую сеть
@@ -655,9 +655,6 @@ def main():
     dat_res  = evaluate_model(dat_model, test_data)
 
     # 6) Отчёт
-    # print("MODEL_D:",MODEL_D)
-    # print("MODEL_HEADS:",MODEL_HEADS)
-    # print("MODEL_LAYERS:",MODEL_LAYERS)
     print_markdown_summary(base_res, dat_res, L=MODEL_LAYERS)
     print_run_hparams(
         d_model=MODEL_D,

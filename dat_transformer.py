@@ -39,8 +39,6 @@ from typing import Optional, Tuple, Dict
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-
 
 # -----------------------------
 # Utilities
@@ -538,7 +536,6 @@ class DynamicEncoder(nn.Module):
             aux["halting_ps"].append(p_i)
             aux["head_gates"].append(attn_info.get("head_gates"))
             aux["attn_weights"].append(attn_info.get("attn_weights"))
-            aux["feats_per_layer"].append(x)  # <— сохраняем признаки слоя для глубокой супервизии
             aux["feats_per_layer"].append(x)  # <— сохраняем признаки слоя для глубокой супервизии
 
             if self.cfg.early_exit:
